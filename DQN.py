@@ -8,30 +8,26 @@ import torch.optim as optim
 import collections
 import argparse
 from torch.utils.tensorboard import SummaryWriter
+import os
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--train', dest='train', action='store_true', default=True)
-parser.add_argument('--test', dest='test', action='store_true', default=True)
-parser.add_argument(
-    '--save_path', default=None, help='folder to save if mode == train else model path,'
-    'qnet will be saved once target net update'
-)
+parser.add_argument('--train', dest='train', action='store_true', default=False)
+parser.add_argument('--test', dest='test', action='store_true', default=False)
 parser.add_argument('--seed', help='random seed', type=int, default=0)
-parser.add_argument('--env_id', default='CartPole-v1', help='CartPole-v0 or PongNoFrameskip-v4')
-parser.add_argument('--noisy_scale', type=float, default=1e-2)
+parser.add_argument('--env_id', default='CartPole-v1', help='CartPole-v1 or Pendulum-v1')
 parser.add_argument('--enable_double', action='store_true', default=False)
 parser.add_argument('--enable_dueling', action='store_true', default=False)
 parser.add_argument('--buffer_size', type=int, default=10000)
-parser.add_argument('--max_frames', type=int, default=200000)
 parser.add_argument('--batch_size', type=int, default=64)
 parser.add_argument('--gamma', type=float, default=0.99)
 parser.add_argument('--lr', type=float, default=1e-3)
-parser.add_argument('--target_update_freq', type=int, default=1000)
-parser.add_argument('--initial_epsilon', type=float, default=0.9)
+parser.add_argument('--target_update_freq', type=int, default=10)
+parser.add_argument('--initial_epsilon', type=float, default=1.0)
 parser.add_argument('--epsilon_decay', type=int, default=500)
-parser.add_argument('--max_episode_length', type=int, default=500)
+parser.add_argument('--num_episodes', type=int, default=1000)
 parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
+parser.add_argument('--render', type=str, default='human', help='render the environment')
 args = parser.parse_args()
 
 # 设置随机种子，确保实验可复现
@@ -41,12 +37,41 @@ torch.manual_seed(0)
 
 # 创建环境
 # env = gym.make('CartPole-v1', render_mode="human", sutton_barto_reward=True)
-env = gym.make('CartPole-v1', sutton_barto_reward=False)
-state_dim = env.observation_space.shape[0]  # 状态维度：4 (小车位置，速度，杆角度，角速度)
-action_dim = env.action_space.n            # 动作维度：2 (向左，向右)
-print(f"状态空间维度: {state_dim}, 动作空间大小: {action_dim}")
+env = gym.make(args.env_id, render_mode=args.render)
+if args.env_id == 'CartPole-v1':
+    state_dim = env.observation_space.shape[0]  # 状态维度：4 (小车位置，速度，杆角度，角速度)
+    action_dim = env.action_space.n            # 动作维度：2 (向左，向右)
+    print(f"状态空间维度: {state_dim}, 动作空间大小: {action_dim}")
+else:  # Pendulum-v1
+    state_dim = env.observation_space.shape[0]  # 状态维度：3 (cos(θ), sin(θ), 角速度)
+    action_dim = 11                            # 动作维度：离散化为11个动作
+    print(f"状态空间维度: {state_dim}, 动作空间大小: {action_dim}")
 device = torch.device(args.device)
 writer = SummaryWriter(log_dir='logs/DQN')
+
+
+def dis_to_con(discrete_action, env, action_dim):  # 离散动作转回连续的函数
+    action_lowbound = env.action_space.low[0]  # 连续动作的最小值
+    action_upbound = env.action_space.high[0]  # 连续动作的最大值
+    return action_lowbound + (discrete_action /
+                              (action_dim - 1)) * (action_upbound -
+                                                   action_lowbound)
+
+
+class VAnet(torch.nn.Module):
+    ''' 只有一层隐藏层的A网络和V网络 '''
+    def __init__(self, state_dim, hidden_dim, action_dim):
+        super(VAnet, self).__init__()
+        self.fc1 = torch.nn.Linear(state_dim, hidden_dim)  # 共享网络部分
+        self.fc_A = torch.nn.Linear(hidden_dim, action_dim)
+        self.fc_V = torch.nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        A = self.fc_A(nn.functional.relu(self.fc1(x)))
+        V = self.fc_V(nn.functional.relu(self.fc1(x)))
+        Q = V + A - A.mean(1).view(-1, 1)  # Q值由V值和A值计算得到
+        return Q
+
 
 # 定义Q网络  
 class DQN(nn.Module):
@@ -57,7 +82,7 @@ class DQN(nn.Module):
         self.fc3 = nn.Linear(128, action_dim) # 输出层，每个动作一个Q值
 
     def forward(self, x):
-        x = torch.relu(self.fc1(x))  # 使用ReLU激活函数引入非线性
+        x = nn.functional.relu(self.fc1(x))  # 使用ReLU激活函数引入非线性
         # x = torch.relu(self.fc2(x))
         return self.fc3(x)           # 输出Q值，不经过激活函数
 
@@ -84,8 +109,12 @@ class DQNAgent:
     def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.98, epsilon=0.01,
                  target_update_freq=10, buffer_size=10000, batch_size=64, device=device):
         self.action_dim = action_dim
-        self.q_net = DQN(state_dim, action_dim).to(device)          # 在线网络
-        self.target_q_net = DQN(state_dim, action_dim).to(device)   # 目标网络
+        if args.enable_dueling:
+            self.q_net = VAnet(state_dim, 128, action_dim).to(device)          # 在线网络
+            self.target_q_net = VAnet(state_dim, 128, action_dim).to(device)   # 目标网络
+        else:
+            self.q_net = DQN(state_dim, action_dim).to(device)          # 在线网络
+            self.target_q_net = DQN(state_dim, action_dim).to(device)   # 目标网络
         self.target_q_net.load_state_dict(self.q_net.state_dict()) # 初始参数一致
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr) # 优化器
 
@@ -189,7 +218,11 @@ def train_agent(env, agent:DQNAgent, num_episodes=500, minimal_size=500, initial
             # 1. 选择并执行动作
             action = agent.take_action(state, epsilon)  # 使用衰减的探索率
             max_q_value = agent.max_q_value(state) * 0.005 + max_q_value * 0.995  # 平滑处理
-            next_state, reward, done, truncated, _ = env.step(action)
+            if args.env_id == 'CartPole-v1':
+                next_state, reward, done, truncated, _ = env.step(action)
+            else:  # Pendulum-v1
+                action_continuous = dis_to_con(action, env, agent.action_dim)  # 离散动作转回连续动作
+                next_state, reward, done, truncated, _ = env.step([action_continuous])
             # 2. 存储经验
             agent.buffer.add(state, action, reward, next_state, done)
             writer.add_scalar('max_q_value', max_q_value, frame_idx)
@@ -214,74 +247,36 @@ def train_agent(env, agent:DQNAgent, num_episodes=500, minimal_size=500, initial
             print(f"回合: {i_episode+1}, 平均奖励 (最近50回合): {np.mean(return_list[-50:]):.1f}, 探索率: {epsilon:.3f}")
 
     print("训练完成！")
+    path = os.path.join('model', '_'.join(["DQN", args.env_id]))
+    if not os.path.exists(path):
+        os.makedirs(path)
+    torch.save(agent.q_net.state_dict(), f"{path}/DQN_{args.env_id}.pth")
     return return_list
 
 # 创建智能体并开始训练
-agent = DQNAgent(state_dim, action_dim, lr=1e-3, gamma=0.99, epsilon=0.01)
-returns = train_agent(env, agent, num_episodes=1000, minimal_size=500, initial_epsilon=1.0, epsilon_decay=500)
-    
+if args.train:
+    agent = DQNAgent(state_dim, action_dim, lr=args.lr, gamma=args.gamma, epsilon=0.01)
+    returns = train_agent(env, agent, num_episodes=args.num_episodes, minimal_size=200, initial_epsilon=args.initial_epsilon, epsilon_decay=args.epsilon_decay)
 
-# # 超参数
-# num_episodes = 500
-# batch_size = 64
-# gamma = 0.99
-# epsilon_start = 1.0
-# epsilon_end = 0.01
-# epsilon_decay = 500
-# learning_rate = 0.001
-# target_update_freq = 100
-# replay_buffer_capacity = 10000
-
-# # 初始化DQN和目标网络
-# policy_net = DQN(state_dim, action_dim)
-# target_net = DQN(state_dim, action_dim)
-# target_net.load_state_dict(policy_net.state_dict()) 
-# optimizer = optim.Adam(policy_net.parameters(), lr=learning_rate)
-# replay_buffer = ReplayBuffer(replay_buffer_capacity)
-# epsilon = epsilon_start
-# steps_done = 0
-# # 训练DQN
-# for episode in range(num_episodes):
-#     state = env.reset()
-#     total_reward = 0
-#     done = False
-
-#     while not done:
-#         # ε-贪婪策略选择动作
-#         epsilon = epsilon_end + (epsilon_start - epsilon_end) * np.exp(-1. * steps_done / epsilon_decay)
-#         steps_done += 1
-#         if random.random() < epsilon:
-#             action = env.action_space.sample()
-#         else:
-#             with torch.no_grad():
-#                 state_tensor = torch.FloatTensor(state).unsqueeze(0)
-#                 q_values = policy_net(state_tensor)
-#                 action = q_values.max(1)[1].item()
-#         next_state, reward, done, _ = env.step(action)
-#         total_reward += reward
-#         replay_buffer.push(state, action, reward, next_state, done)
-#         state = next_state
-#         # 从经验回放缓冲区采样并训练
-#         if len(replay_buffer) >= batch_size:
-#             states, actions, rewards, next_states, dones = replay_buffer.sample(batch_size)
-#             states_tensor = torch.FloatTensor(states)
-#             actions_tensor = torch.LongTensor(actions).unsqueeze(1)
-#             rewards_tensor = torch.FloatTensor(rewards).unsqueeze(1)
-#             next_states_tensor = torch.FloatTensor(next_states)
-#             dones_tensor = torch.FloatTensor(dones).unsqueeze(1)
-
-#             current_q_values = policy_net(states_tensor).gather(1, actions_tensor)
-#             next_q_values = target_net(next_states_tensor).max(1)[0].detach().unsqueeze(1)
-#             expected_q_values = rewards_tensor + (gamma * next_q_values * (1 - dones_tensor))
-
-#             loss = nn.MSELoss()(current_q_values, expected_q_values)
-
-#             optimizer.zero_grad()
-#             loss.backward()
-#             optimizer.step()
-#         # 定期更新目标网络
-#         if steps_done % target_update_freq == 0:
-#             target_net.load_state_dict(policy_net.state_dict())
-#     print(f"Episode {episode}, Total Reward: {total_reward}")
-
-    
+# 测试智能体
+if args.test:
+    agent = DQNAgent(state_dim, action_dim, lr=args.lr, gamma=args.gamma, epsilon=0.01)
+    path = os.path.join('model', '_'.join(["DQN", args.env_id]))
+    agent.q_net.load_state_dict(torch.load(f"{path}/DQN_{args.env_id}.pth", map_location=device))
+    agent.q_net.eval()
+    for i_episode in range(100):
+        state, _ = env.reset()
+        episode_return = 0
+        done = False
+        while not done:
+            action = agent.take_action(state, epsilon=0.0)  # 测试时不探索
+            if args.env_id == 'CartPole-v1':
+                next_state, reward, done, truncated, _ = env.step(action)
+            else:
+                action_continuous = dis_to_con(action, env, agent.action_dim)  # 离散动作转回连续动作
+                next_state, reward, done, truncated, _ = env.step([action_continuous])
+            state = next_state
+            episode_return += reward
+            if done or truncated:
+                break
+        print(f"测试回合: {i_episode+1}, 总奖励: {episode_return}")
