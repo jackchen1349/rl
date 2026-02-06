@@ -27,7 +27,7 @@ parser.add_argument('--initial_epsilon', type=float, default=1.0)
 parser.add_argument('--epsilon_decay', type=int, default=500)
 parser.add_argument('--num_episodes', type=int, default=1000)
 parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
-parser.add_argument('--render', type=str, default='human', help='render the environment')
+parser.add_argument('--render', type=str, default='human', help='rgb_array or human')
 args = parser.parse_args()
 
 # 设置随机种子，确保实验可复现
@@ -58,7 +58,7 @@ def dis_to_con(discrete_action, env, action_dim):  # 离散动作转回连续的
                                                    action_lowbound)
 
 
-class VAnet(torch.nn.Module):
+class VAnet(nn.Module):
     ''' 只有一层隐藏层的A网络和V网络 '''
     def __init__(self, state_dim, hidden_dim, action_dim):
         super(VAnet, self).__init__()
@@ -83,7 +83,7 @@ class DQN(nn.Module):
 
     def forward(self, x):
         x = nn.functional.relu(self.fc1(x))  # 使用ReLU激活函数引入非线性
-        # x = torch.relu(self.fc2(x))
+        # x = nn.functional.relu(self.fc2(x))
         return self.fc3(x)           # 输出Q值，不经过激活函数
 
 
@@ -256,7 +256,7 @@ def train_agent(env, agent:DQNAgent, num_episodes=500, minimal_size=500, initial
 # 创建智能体并开始训练
 if args.train:
     agent = DQNAgent(state_dim, action_dim, lr=args.lr, gamma=args.gamma, epsilon=0.01)
-    returns = train_agent(env, agent, num_episodes=args.num_episodes, minimal_size=200, initial_epsilon=args.initial_epsilon, epsilon_decay=args.epsilon_decay)
+    returns = train_agent(env, agent, num_episodes=args.num_episodes, minimal_size=500, initial_epsilon=args.initial_epsilon, epsilon_decay=args.epsilon_decay)
 
 # 测试智能体
 if args.test:
