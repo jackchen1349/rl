@@ -7,7 +7,6 @@ import argparse
 import random
 import os
 from torch.utils.tensorboard import SummaryWriter
-import collections
 
 
 parser = argparse.ArgumentParser()
@@ -21,24 +20,6 @@ parser.add_argument('--num_episodes', type=int, default=1000)
 parser.add_argument('--device', type=str, default='cuda:0' if torch.cuda.is_available() else 'cpu')
 parser.add_argument('--render', type=str, default='human', help='rgb_array or human')
 args = parser.parse_args()
-
-
-# 经验回放缓冲区
-class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = collections.deque(maxlen=capacity)  # 双端队列，自动淘汰旧经验
-
-    def add(self, state, action, reward, next_state, done):
-        self.buffer.append((state, action, reward, next_state, done))
-
-    def sample(self, batch_size):
-        transitions = random.sample(self.buffer, batch_size)
-        # 将数据整理成按列堆叠的张量，便于神经网络批量处理
-        state, action, reward, next_state, done = zip(*transitions)
-        return (state, action, reward, next_state, done)
-
-    def size(self):
-        return len(self.buffer)
 
 
 class PolicyNet(torch.nn.Module):
@@ -151,57 +132,6 @@ def train_on_policy_agent():
                 return_list.append(episode_return)
                 writer.add_scalar('episode_reward', episode_return, i_episode + i*int(args.num_episodes/10))
                 agent.update(transition_dict)
-                if (i_episode+1) % 10 == 0:
-                    pbar.set_postfix({'episode': '%d' % (args.num_episodes/10 * i + i_episode+1), 'return': '%.3f' % np.mean(return_list[-10:])})
-                pbar.update(1)
-    print("训练完成！")
-    path = os.path.join('model', '_'.join(["AC", args.env_id]))
-    if not os.path.exists(path):
-        os.makedirs(path)
-    torch.save(agent.actor.state_dict(), f"{path}/AC_{args.env_id}_actor.pth")
-    torch.save(agent.critic.state_dict(), f"{path}/AC_{args.env_id}_critic.pth")
-
-    return return_list
-
-
-def train_off_policy_agent(minimal_size = 100, batch_size = 64):
-    writer = SummaryWriter(log_dir='logs/AC/off_policy')
-    # 设置随机种子，确保实验可复现
-    random.seed(0)
-    np.random.seed(0)
-    torch.manual_seed(0)
-    env = gym.make(args.env_id, render_mode=args.render)
-    actor_lr = 1e-3
-    critic_lr = 1e-2
-    hidden_dim = 128
-    device = torch.device(args.device) if torch.cuda.is_available() else torch.device("cpu")
-
-    state_dim = env.observation_space.shape[0]
-    action_dim = env.action_space.n
-    agent = ActorCritic(state_dim, hidden_dim, action_dim, actor_lr, critic_lr, args.gamma, device)
-    return_list = []
-    replay_buffer = ReplayBuffer(capacity=10000)
-
-    for i in range(10):
-        with tqdm(total=int(args.num_episodes/10), desc='Iteration %d' % i) as pbar:
-            for i_episode in range(int(args.num_episodes/10)):
-                episode_return = 0
-                state, _ = env.reset(seed=args.seed)
-                done = False
-                while not done:
-                    action = agent.take_action(state)
-                    next_state, reward, done, truncated, _ = env.step(action)
-                    replay_buffer.add(state, action, reward, next_state, done)
-                    state = next_state
-                    episode_return += reward
-                    if replay_buffer.size() > minimal_size:
-                        b_s, b_a, b_r, b_ns, b_d = replay_buffer.sample(batch_size)
-                        transition_dict = {'states': b_s, 'actions': b_a, 'next_states': b_ns, 'rewards': b_r, 'dones': b_d}
-                        agent.update(transition_dict)
-                    if done or truncated:
-                        break
-                return_list.append(episode_return)
-                writer.add_scalar('episode_reward', episode_return, i_episode + i*int(args.num_episodes/10))
                 if (i_episode+1) % 10 == 0:
                     pbar.set_postfix({'episode': '%d' % (args.num_episodes/10 * i + i_episode+1), 'return': '%.3f' % np.mean(return_list[-10:])})
                 pbar.update(1)
